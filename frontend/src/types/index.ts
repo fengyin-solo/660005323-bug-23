@@ -15,11 +15,22 @@ export interface OEEItem {
   availability: number; performance: number; quality: number
 }
 
+export interface ShiftInfo {
+  index: number
+  label: string
+  start_hour: number
+  end_hour: number
+  start_ts: number
+}
+
 export interface FactoryData {
   devices: Device[]
   production: number
+  shift_production?: number
+  shift?: ShiftInfo
   anomalies: Anomaly[]
   oee: OEEItem[]
+  server_time?: number
 }
 
 export const DEVICE_COLORS: Record<string, string> = {
