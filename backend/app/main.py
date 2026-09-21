@@ -1,9 +1,17 @@
+from __future__ import annotations
+
 import asyncio, math, random, time, json, threading
 from collections import defaultdict, deque
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import numpy as np
+
+try:  # numpy 不可用时仍可启动（趋势检测退化为纯 Python 计算）
+    import numpy as np
+except ImportError:  # pragma: no cover
+    np = None
+
+from app.config import settings
 
 app = FastAPI(title="Digital Twin Factory Monitor")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -12,6 +20,9 @@ DEVICE_TYPES = ["CNC", "RobotArm", "Conveyor", "AGV", "InjectionMolding", "QCSta
 STATUSES = ["RUNNING", "IDLE", "FAULT", "OFFLINE"]
 ACTIVE_CLIENTS: list[WebSocket] = []
 SIMULATOR_RUNNING = True
+# 主事件循环：模拟器在子线程里推送 WS 时必须通过它调度协程
+MAIN_LOOP: asyncio.AbstractEventLoop | None = None
+
 
 class DeviceState:
     def __init__(self, did: int, dtype: str, x: float, y: float, z: float):
@@ -40,8 +51,29 @@ class DeviceState:
 devices = {i: DeviceState(i, random.choice(DEVICE_TYPES),
                           random.uniform(-5, 5), 0.5, random.uniform(-5, 5)) for i in range(1, 13)}
 
-production_log = []
-anomaly_log = []
+# 产量日志按配置的保留时长做时间裁剪（deque 只保留最多 retention/interval+余量 条）
+_retention_capacity = max(1, int(settings.retention_sec / settings.sample_interval_sec) + 2)
+production_log: deque = deque(maxlen=_retention_capacity)
+anomaly_log: deque = deque(maxlen=500)
+
+
+def current_shift_start(now: float | None = None) -> float:
+    """最近一个班次边界的 unix 时间戳（按本地时区、配置的班次开始整点）。"""
+    t = time.time() if now is None else now
+    local = time.localtime(t)
+    today_boundary = time.mktime((local.tm_year, local.tm_mon, local.tm_mday,
+                                  settings.shift_start_hour, 0, 0, 0, 0, -1))
+    if t >= today_boundary:
+        return today_boundary
+    yesterday = time.localtime(today_boundary - 86400)
+    return time.mktime((yesterday.tm_year, yesterday.tm_mon, yesterday.tm_mday,
+                        settings.shift_start_hour, 0, 0, 0, 0, -1))
+
+
+# 当前班次开始时的总产量基线，用于计算“本班次产量”
+shift_base_total = 0
+shift_start_ts = current_shift_start()
+
 
 class AnomalyRules:
     def __init__(self):
@@ -65,8 +97,15 @@ class AnomalyRules:
         self.windows[key].append(dev.temperature)
         if len(self.windows[key]) >= 8:
             vals = list(self.windows[key])
-            if np.mean(vals[-4:]) - np.mean(vals[:4]) > 3:
-                triggers.append({"device_id": dev.id, "rule": "温度趋势上升", "value": round(np.mean(vals[-4:]), 2), "threshold": ">3°C/周期"})
+            first4, last4 = vals[:4], vals[-4:]
+            if np is not None:
+                rising = np.mean(last4) - np.mean(first4) > 3
+                last_mean = float(np.mean(last4))
+            else:
+                rising = sum(last4) / 4 - sum(first4) / 4 > 3
+                last_mean = sum(last4) / 4
+            if rising:
+                triggers.append({"device_id": dev.id, "rule": "温度趋势上升", "value": round(last_mean, 2), "threshold": ">3°C/周期"})
 
         if triggers:
             anomaly_log.append({"timestamp": time.time(), "triggers": triggers, "device_type": dev.type})
@@ -74,14 +113,58 @@ class AnomalyRules:
 
 rules_engine = AnomalyRules()
 
+
+def shift_production() -> int:
+    """本班次内的产量（跨过配置的班次边界时归零重计）。"""
+    return sum(d.production_count for d in devices.values()) - shift_base_total
+
+
+def trim_production_log(now: float) -> None:
+    cutoff = now - settings.retention_sec
+    while production_log and production_log[0]["timestamp"] < cutoff:
+        production_log.popleft()
+
+
+async def broadcast(message: str) -> None:
+    if not ACTIVE_CLIENTS:
+        return
+    dead = []
+    for ws in list(ACTIVE_CLIENTS):
+        try:
+            await ws.send_text(message)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        if ws in ACTIVE_CLIENTS:
+            ACTIVE_CLIENTS.remove(ws)
+
+
 def simulate():
+    global shift_base_total, shift_start_ts
+    next_tick = time.monotonic()
     while SIMULATOR_RUNNING:
+        # 固定节拍：以单调时钟补偿循环耗时，保证采样间隔与配置一致（修复耗时漂移）
+        next_tick += settings.sample_interval_sec
+        sleep_s = next_tick - time.monotonic()
+        if sleep_s > 0:
+            time.sleep(sleep_s)
+        else:
+            next_tick = time.monotonic()
+
+        now = time.time()
+
+        # 跨过班次边界：把当前总产量记为新班次基线
+        boundary = current_shift_start(now)
+        if boundary != shift_start_ts:
+            shift_start_ts = boundary
+            shift_base_total = sum(d.production_count for d in devices.values())
+
         for dev in devices.values():
-            drift = 0.1 * math.sin(time.time() * 0.5 + dev.id)
+            drift = 0.1 * math.sin(now * 0.5 + dev.id)
             noise = random.gauss(0, 0.3)
             dev.temperature = max(25, min(65, dev.temperature + drift + noise))
 
-            v_drift = 0.02 * math.sin(time.time() * 0.3 + dev.id * 0.7)
+            v_drift = 0.02 * math.sin(now * 0.3 + dev.id * 0.7)
             dev.vibration = max(0, min(3, dev.vibration + v_drift + random.gauss(0, 0.05)))
 
             dev.pressure = max(0.5, min(2, dev.pressure + random.gauss(0, 0.02)))
@@ -95,36 +178,33 @@ def simulate():
             if dev.status == "RUNNING":
                 if random.random() < 0.4:
                     dev.production_count += 1
-                dev.uptime += 1
+                dev.uptime += settings.sample_interval_sec
 
             triggers = rules_engine.check(dev)
             if triggers and dev.status != "FAULT" and random.random() < 0.3:
                 dev.status = "FAULT"
 
-        production_log.append({"timestamp": time.time(), "count": sum(d.production_count for d in devices.values())})
+        total = sum(d.production_count for d in devices.values())
+        production_log.append({"timestamp": now, "count": total})
+        trim_production_log(now)
 
+        payload = {
+            "devices": [d.to_dict() for d in devices.values()],
+            "production": shift_production(),
+            "anomalies": list(anomaly_log)[-5:] if anomaly_log else [],
+            "oee": calculate_oee(),
+            "shift": {"start_hour": settings.shift_start_hour, "start_ts": shift_start_ts},
+        }
         try:
-            payload = {
-                "devices": [d.to_dict() for d in devices.values()],
-                "production": sum(d.production_count for d in devices.values()),
-                "anomalies": anomaly_log[-5:] if anomaly_log else [],
-                "oee": calculate_oee()
-            }
-            msg = json.dumps(payload)
-        except:
+            message = json.dumps(payload)
+        except (TypeError, ValueError):
             continue
 
-        dead = []
-        for ws in ACTIVE_CLIENTS:
+        if MAIN_LOOP is not None and ACTIVE_CLIENTS:
             try:
-                asyncio.run_coroutine_threadsafe(ws.send_text(msg), asyncio.get_event_loop())
-            except:
-                dead.append(ws)
-        for ws in dead:
-            if ws in ACTIVE_CLIENTS:
-                ACTIVE_CLIENTS.remove(ws)
-
-        time.sleep(1)
+                asyncio.run_coroutine_threadsafe(broadcast(message), MAIN_LOOP)
+            except RuntimeError:
+                pass  # 事件循环已关闭（停机中）
 
 
 def calculate_oee():
@@ -151,13 +231,24 @@ class OEEAnalysis(BaseModel):
 
 @app.on_event("startup")
 async def startup():
+    global MAIN_LOOP
+    MAIN_LOOP = asyncio.get_running_loop()
     t = threading.Thread(target=simulate, daemon=True)
     t.start()
 
 
+@app.get("/api/config")
+def get_config():
+    """前端启动时拉取统计口径，作为环境变量之外的权威来源。"""
+    return {"config": settings.public(), "source": settings.config_source}
+
+
 @app.get("/api/devices")
 def get_devices():
-    return {"devices": [d.to_dict() for d in devices.values()], "anomalies": anomaly_log[-10:]}
+    return {"devices": [d.to_dict() for d in devices.values()],
+            "anomalies": list(anomaly_log)[-10:],
+            "shift_production": shift_production(),
+            "shift": {"start_hour": settings.shift_start_hour, "start_ts": shift_start_ts}}
 
 
 @app.get("/api/oee")
@@ -167,7 +258,8 @@ def get_oee():
 
 @app.get("/api/production")
 def get_production():
-    return {"log": production_log[-60:]}
+    trim_production_log(time.time())
+    return {"log": list(production_log)}
 
 
 @app.websocket("/ws")
